@@ -12,7 +12,7 @@ import 'dart:typed_data';
 import 'package:esc_pos_utils_plus/esc_pos_utils_plus.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart' as serial;
+import 'package:flutter_bluetooth_classic_serial/flutter_bluetooth_classic.dart' as serial;
 import './enums.dart';
 import 'package:async/async.dart';
 
@@ -59,7 +59,7 @@ class PrinterBluetoothManager {
   BluetoothCharacteristic? _writeChar;
   BluetoothDevice? _connectedDevice;
   // SPP相关
-  serial.BluetoothConnection? _sppConnection;
+  final serial.FlutterBluetoothClassic _classic = serial.FlutterBluetoothClassic();
   final BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
   Stream<bool> get isScanningStream => _isScanning.stream;
   final BehaviorSubject<List<PrinterBluetooth>> _scanResults =
@@ -95,12 +95,13 @@ class PrinterBluetoothManager {
       });
       FlutterBluePlus.startScan(timeout: timeout);
     }
-    // SPP扫描
+    // SPP扫描（只能获取已配对设备）
     if (type == null || type == BluetoothType.spp) {
-      _sppScanSub = serial.FlutterBluetoothSerial.instance.startDiscovery().listen((r) {
-        found.add(PrinterBluetooth.spp(r.device));
-        _scanResults.add(List<PrinterBluetooth>.from(found));
-      });
+      List<serial.BluetoothDevice> devices = await _classic.getPairedDevices();
+      for (final device in devices) {
+        found.add(PrinterBluetooth.spp(device));
+      }
+      _scanResults.add(List<PrinterBluetooth>.from(found));
     }
     // 超时后自动停止
     Future.delayed(timeout, () async {
@@ -111,7 +112,7 @@ class PrinterBluetoothManager {
   /// 停止扫描
   Future<void> stopScan() async {
     await FlutterBluePlus.stopScan();
-    await serial.FlutterBluetoothSerial.instance.cancelDiscovery();
+    await _classic.stopDiscovery();
     _isScanning.add(false);
     await _scanResultsSubscription?.cancel();
     await _bleScanSub?.cancel();
@@ -270,7 +271,13 @@ class PrinterBluetoothManager {
     }
     try {
       _isPrinting = true;
-      _sppConnection = await serial.BluetoothConnection.toAddress(device.address);
+      // 连接
+      final connected = await _classic.connect(device.address);
+      if (!connected) {
+        _isPrinting = false;
+        completer.complete(PosPrintResult.timeout);
+        return completer.future;
+      }
       // 分包写入
       final len = bytes.length;
       List<List<int>> chunks = [];
@@ -279,21 +286,16 @@ class PrinterBluetoothManager {
         chunks.add(bytes.sublist(i, end));
       }
       for (var i = 0; i < chunks.length; i += 1) {
-        _sppConnection?.output.add(Uint8List.fromList(chunks[i]));
-        await _sppConnection?.output.allSent;
+        await _classic.sendData(chunks[i]);
         sleep(Duration(milliseconds: queueSleepTimeMs));
       }
+      await _classic.disconnect();
       completer.complete(PosPrintResult.success);
-      // 延迟断开
-      _runDelayed(3).then((dynamic v) async {
-        await _sppConnection?.close();
-        _isPrinting = false;
-      });
       _isConnected = true;
     } catch (e) {
       _isPrinting = false;
       try {
-        await _sppConnection?.close();
+        await _classic.disconnect();
       } catch (_) {}
       completer.complete(PosPrintResult.timeout);
     }

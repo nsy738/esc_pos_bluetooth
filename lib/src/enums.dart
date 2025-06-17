@@ -34,3 +34,9 @@ class PosPrintResult {
     }
   }
 }
+
+/// 设备类型枚举，区分BLE和SPP
+enum BluetoothType {
+  ble, // 低功耗蓝牙
+  spp, // 经典蓝牙串口
+}

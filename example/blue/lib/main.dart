@@ -39,6 +39,7 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   PrinterBluetoothManager printerManager = PrinterBluetoothManager();
   List<PrinterBluetooth> _devices = [];
+  BluetoothType? _filterType; // null=All, ble, spp
 
   @override
   void initState() {
@@ -70,7 +71,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _devices = [];
     });
-    printerManager.startScan(Duration(seconds: 10));
+    printerManager.startScan(Duration(seconds: 10), type: _filterType);
   }
 
   void _stopScanDevices() {
@@ -285,14 +286,42 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   Widget build(BuildContext context) {
     // 优先显示有name的设备，无name的排在后面
+    List<PrinterBluetooth> filtered = _filterType == null
+        ? _devices
+        : _devices.where((d) => d.type == _filterType).toList();
     final List<PrinterBluetooth> sortedDevices = [
-      ..._devices.where((d) => (d.name != null && d.name!.trim().isNotEmpty)),
-      ..._devices.where((d) => (d.name == null || d.name!.trim().isEmpty)),
+      ...filtered.where((d) => (d.name != null && d.name!.trim().isNotEmpty)),
+      ...filtered.where((d) => (d.name == null || d.name!.trim().isEmpty)),
     ];
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.title),
         actions: [
+          DropdownButton<BluetoothType?>(
+            value: _filterType,
+            underline: SizedBox(),
+            icon: Icon(Icons.filter_alt, color: Colors.white),
+            dropdownColor: Colors.white,
+            items: [
+              DropdownMenuItem(
+                value: null,
+                child: Text('All'),
+              ),
+              DropdownMenuItem(
+                value: BluetoothType.ble,
+                child: Text('BLE'),
+              ),
+              DropdownMenuItem(
+                value: BluetoothType.spp,
+                child: Text('SPP'),
+              ),
+            ],
+            onChanged: (v) {
+              setState(() {
+                _filterType = v;
+              });
+            },
+          ),
           IconButton(
             icon: Icon(Icons.refresh),
             tooltip: 'Refresh Bluetooth',
@@ -324,9 +353,22 @@ class _MyHomePageState extends State<MyHomePage> {
                         children: <Widget>[
                           Text(device.name ?? device.address ?? '', style: TextStyle(fontWeight: FontWeight.bold)),
                           Text(device.address ?? '', style: TextStyle(color: Colors.grey[700], fontSize: 13)),
-                          Text(
-                            'Click to print a test receipt',
-                            style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                          Row(
+                            children: [
+                              Text(
+                                device.type == BluetoothType.ble ? 'BLE' : 'SPP',
+                                style: TextStyle(
+                                  color: device.type == BluetoothType.ble ? Colors.blue : Colors.green,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              SizedBox(width: 8),
+                              Text(
+                                'Click to print a test receipt',
+                                style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                              ),
+                            ],
                           ),
                         ],
                       ),

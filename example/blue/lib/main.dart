@@ -71,7 +71,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _devices = [];
     });
-    printerManager.startScan(Duration(seconds: 10));
+    printerManager.startScan(Duration(seconds: 10), type: _filterType);
   }
 
   void _stopScanDevices() {

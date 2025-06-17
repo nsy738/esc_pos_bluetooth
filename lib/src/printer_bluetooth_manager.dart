@@ -14,6 +14,7 @@ import 'package:rxdart/rxdart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart' as serial;
 import './enums.dart';
+import 'package:async/async.dart';
 
 /// 关键设计思路：
 /// 1. flutter_blue_plus 只支持 BLE，API 与 flutter_bluetooth_basic 完全不同。
@@ -70,29 +71,37 @@ class PrinterBluetoothManager {
   static const String printerCharUUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
   // 新增：用于UI选择特征的回调
   void Function(List<Map<String, dynamic>>)? onWritableCharacteristicsDiscovered;
+  StreamSubscription? _bleScanSub;
+  StreamSubscription? _sppScanSub;
 
   Future _runDelayed(int seconds) {
     return Future<dynamic>.delayed(Duration(seconds: seconds));
   }
 
-  /// 扫描所有蓝牙设备（BLE+SPP）
-  void startScan(Duration timeout) async {
+  /// 扫描蓝牙设备，可选BLE/SPP/Both
+  void startScan(Duration timeout, {BluetoothType? type}) async {
     _scanResults.add(<PrinterBluetooth>[]);
     _isScanning.add(true);
     List<PrinterBluetooth> found = [];
     _scanResultsSubscription?.cancel();
+    _bleScanSub?.cancel();
+    _sppScanSub?.cancel();
     // BLE扫描
-    FlutterBluePlus.startScan(timeout: timeout);
-    _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) {
-      found.addAll(results
-          .map((r) => PrinterBluetooth(r.device, advData: r.advertisementData)));
-      _scanResults.add(List<PrinterBluetooth>.from(found));
-    });
+    if (type == null || type == BluetoothType.ble) {
+      _bleScanSub = FlutterBluePlus.scanResults.listen((results) {
+        found.addAll(results
+            .map((r) => PrinterBluetooth(r.device, advData: r.advertisementData)));
+        _scanResults.add(List<PrinterBluetooth>.from(found));
+      });
+      FlutterBluePlus.startScan(timeout: timeout);
+    }
     // SPP扫描
-    serial.FlutterBluetoothSerial.instance.startDiscovery().listen((r) {
-      found.add(PrinterBluetooth.spp(r.device));
-      _scanResults.add(List<PrinterBluetooth>.from(found));
-    });
+    if (type == null || type == BluetoothType.spp) {
+      _sppScanSub = serial.FlutterBluetoothSerial.instance.startDiscovery().listen((r) {
+        found.add(PrinterBluetooth.spp(r.device));
+        _scanResults.add(List<PrinterBluetooth>.from(found));
+      });
+    }
     // 超时后自动停止
     Future.delayed(timeout, () async {
       await stopScan();
@@ -105,6 +114,8 @@ class PrinterBluetoothManager {
     await serial.FlutterBluetoothSerial.instance.cancelDiscovery();
     _isScanning.add(false);
     await _scanResultsSubscription?.cancel();
+    await _bleScanSub?.cancel();
+    await _sppScanSub?.cancel();
   }
 
   /// 选择打印机

@@ -20,6 +20,7 @@ dependencies:
     git:
       url: https://github.com/nsy738/flutter_bluetooth_basic
       ref: master
+  flutter_blue_plus: ^1.35.5
   image: ^4.0.6
 
 dev_dependencies:

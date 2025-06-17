@@ -10,27 +10,37 @@ import 'dart:async';
 import 'dart:io';
 import 'package:esc_pos_utils_plus/esc_pos_utils_plus.dart';
 import 'package:rxdart/rxdart.dart';
-import 'package:flutter_bluetooth_basic/flutter_bluetooth_basic.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import './enums.dart';
 
-/// Bluetooth printer
-class PrinterBluetooth {
-  PrinterBluetooth(this._device);
-  final BluetoothDevice _device;
+/// 关键设计思路：
+/// 1. flutter_blue_plus 只支持 BLE，API 与 flutter_bluetooth_basic 完全不同。
+/// 2. 设备扫描、连接、数据发送都要用 flutter_blue_plus 的方式重写。
+/// 3. BLE 打印机通常需要指定 Service UUID 和 Characteristic UUID，数据通过 writeCharacteristic 发送。
+/// 4. 需维护设备扫描、连接、写入等状态流，兼容原有接口。
+/// 5. 需兼容原有 PrinterBluetooth/PrinterBluetoothManager 的接口，便于上层调用不变。
 
-  String? get name => _device.name;
-  String? get address => _device.address;
-  int? get type => _device.type;
+/// Bluetooth printer 封装 BLE 设备
+class PrinterBluetooth {
+  PrinterBluetooth(this.device, {this.advData});
+  final BluetoothDevice device;
+  final AdvertisementData? advData;
+
+  String? get name => device.platformName;
+  String? get address => device.remoteId.str;
+  // BLE 没有 type 概念，兼容接口
+  int? get type => null;
 }
 
-/// Printer Bluetooth Manager
+/// BLE 打印机管理器
 class PrinterBluetoothManager {
-  final BluetoothManager _bluetoothManager = BluetoothManager.instance;
+  // 维护扫描和连接状态
   bool _isPrinting = false;
   bool _isConnected = false;
   StreamSubscription? _scanResultsSubscription;
-  StreamSubscription? _isScanningSubscription;
   PrinterBluetooth? _selectedPrinter;
+  BluetoothCharacteristic? _writeChar;
+  BluetoothDevice? _connectedDevice;
 
   final BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
   Stream<bool> get isScanningStream => _isScanning.stream;
@@ -39,46 +49,60 @@ class PrinterBluetoothManager {
       BehaviorSubject.seeded([]);
   Stream<List<PrinterBluetooth>> get scanResults => _scanResults.stream;
 
+  // 需根据实际打印机填写 Service/Characteristic UUID
+  // 可通过 nRF Connect 等工具扫描获得
+  static const String printerServiceUUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
+  static const String printerCharUUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
+
+  // 新增：用于UI选择特征的回调
+  void Function(List<Map<String, dynamic>>)? onWritableCharacteristicsDiscovered;
+
   Future _runDelayed(int seconds) {
     return Future<dynamic>.delayed(Duration(seconds: seconds));
   }
 
+  /// 扫描 BLE 设备
   void startScan(Duration timeout) async {
     _scanResults.add(<PrinterBluetooth>[]);
+    _isScanning.add(true);
+    List<PrinterBluetooth> found = [];
+    _scanResultsSubscription?.cancel();
 
-    _bluetoothManager.startScan(timeout: timeout);
-
-    _scanResultsSubscription = _bluetoothManager.scanResults.listen((devices) {
-      _scanResults.add(devices.map((d) => PrinterBluetooth(d)).toList());
+    // 启动扫描
+    FlutterBluePlus.startScan(timeout: timeout);
+    _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) {
+      found = results
+          .map((r) => PrinterBluetooth(r.device, advData: r.advertisementData))
+          .toList();
+      _scanResults.add(found);
     });
 
-    _isScanningSubscription =
-        _bluetoothManager.isScanning.listen((isScanningCurrent) async {
-      // If isScanning value changed (scan just stopped)
-      if (_isScanning.value! && !isScanningCurrent) {
-        _scanResultsSubscription!.cancel();
-        _isScanningSubscription!.cancel();
-      }
-      _isScanning.add(isScanningCurrent);
+    // 超时后自动停止
+    Future.delayed(timeout, () async {
+      await stopScan();
     });
   }
 
-  void stopScan() async {
-    await _bluetoothManager.stopScan();
+  /// 停止扫描
+  Future<void> stopScan() async {
+    await FlutterBluePlus.stopScan();
+    _isScanning.add(false);
+    await _scanResultsSubscription?.cancel();
   }
 
+  /// 选择打印机
   void selectPrinter(PrinterBluetooth printer) {
     _selectedPrinter = printer;
   }
 
+  /// 连接并写入数据
   Future<PosPrintResult> writeBytes(
     List<int> bytes, {
     int chunkSizeBytes = 20,
     int queueSleepTimeMs = 20,
   }) async {
     final Completer<PosPrintResult> completer = Completer();
-
-    const int timeout = 5;
+    const int timeout = 10;
     if (_selectedPrinter == null) {
       return Future<PosPrintResult>.value(PosPrintResult.printerNotSelected);
     } else if (_isScanning.value!) {
@@ -86,62 +110,106 @@ class PrinterBluetoothManager {
     } else if (_isPrinting) {
       return Future<PosPrintResult>.value(PosPrintResult.printInProgress);
     }
-
     _isPrinting = true;
-
-    // We have to rescan before connecting, otherwise we can connect only once
-    await _bluetoothManager.startScan(timeout: Duration(seconds: 1));
-    await _bluetoothManager.stopScan();
-
-    // Connect
-    await _bluetoothManager.connect(_selectedPrinter!._device);
-
-    // Subscribe to the events
-    _bluetoothManager.state.listen((state) async {
-      switch (state) {
-        case BluetoothManager.CONNECTED:
-          // To avoid double call
-          if (!_isConnected) {
-            final len = bytes.length;
-            List<List<int>> chunks = [];
-            for (var i = 0; i < len; i += chunkSizeBytes) {
-              var end = (i + chunkSizeBytes < len) ? i + chunkSizeBytes : len;
-              chunks.add(bytes.sublist(i, end));
-            }
-
-            for (var i = 0; i < chunks.length; i += 1) {
-              await _bluetoothManager.writeData(chunks[i]);
-              sleep(Duration(milliseconds: queueSleepTimeMs));
-            }
-
-            completer.complete(PosPrintResult.success);
-          }
-          // TODO sending disconnect signal should be event-based
-          _runDelayed(3).then((dynamic v) async {
-            await _bluetoothManager.disconnect();
-            _isPrinting = false;
-          });
-          _isConnected = true;
-          break;
-        case BluetoothManager.DISCONNECTED:
-          _isConnected = false;
-          break;
-        default:
-          break;
+    final device = _selectedPrinter!.device;
+    try {
+      // 连接设备
+      await device.connect(timeout: Duration(seconds: 5));
+      _connectedDevice = device;
+      // 发现服务
+      List<BluetoothService> services = await device.discoverServices();
+      // 调试：打印所有服务和特征UUID及write属性
+      for (var service in services) {
+        print('[BLE] Service: [32m${service.uuid.str}[0m');
+        for (var c in service.characteristics) {
+          print('  [BLE] Characteristic: [36m${c.uuid.str}[0m, write: ${c.properties.write}');
+        }
       }
-    });
-
-    // Printing timeout
+      // 收集所有支持write的特征
+      List<Map<String, dynamic>> writableChars = [];
+      for (var service in services) {
+        for (var c in service.characteristics) {
+          if (c.properties.write) {
+            writableChars.add({
+              'service': service.uuid.str,
+              'char': c.uuid.str,
+              'charObj': c,
+            });
+          }
+        }
+      }
+      // 如果有回调，交给UI选择
+      if (onWritableCharacteristicsDiscovered != null && writableChars.isNotEmpty) {
+        onWritableCharacteristicsDiscovered!(writableChars);
+        // UI选择后会赋值writeChar
+        // 这里直接return，等待UI回调
+        _isPrinting = false;
+        await device.disconnect();
+        return PosPrintResult.timeout;
+      }
+      // 自动选择第一个支持write的特征
+      BluetoothCharacteristic? writeChar;
+      if (writableChars.isNotEmpty) {
+        writeChar = writableChars.first['charObj'];
+        print('[BLE] Auto-selected first writable characteristic: service=${writableChars.first['service']}, char=${writableChars.first['char']}');
+      } else {
+        // 兼容：如果没找到，还是用UUID匹配
+        for (var service in services) {
+          if (service.uuid.str.toLowerCase() == printerServiceUUID) {
+            for (var c in service.characteristics) {
+              if (c.uuid.str.toLowerCase() == printerCharUUID && c.properties.write) {
+                writeChar = c;
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (writeChar == null) {
+        await device.disconnect();
+        _isPrinting = false;
+        return PosPrintResult.timeout;
+      }
+      _writeChar = writeChar;
+      // 分包写入
+      final len = bytes.length;
+      List<List<int>> chunks = [];
+      for (var i = 0; i < len; i += chunkSizeBytes) {
+        var end = (i + chunkSizeBytes < len) ? i + chunkSizeBytes : len;
+        chunks.add(bytes.sublist(i, end));
+      }
+      for (var i = 0; i < chunks.length; i += 1) {
+        await writeChar.write(chunks[i], withoutResponse: true);
+        sleep(Duration(milliseconds: queueSleepTimeMs));
+      }
+      completer.complete(PosPrintResult.success);
+      // 延迟断开
+      _runDelayed(3).then((dynamic v) async {
+        await device.disconnect();
+        _isPrinting = false;
+      });
+      _isConnected = true;
+    } catch (e) {
+      _isPrinting = false;
+      try {
+        await device.disconnect();
+      } catch (_) {}
+      completer.complete(PosPrintResult.timeout);
+    }
+    // 打印超时
     _runDelayed(timeout).then((dynamic v) async {
       if (_isPrinting) {
         _isPrinting = false;
+        try {
+          await device.disconnect();
+        } catch (_) {}
         completer.complete(PosPrintResult.timeout);
       }
     });
-
     return completer.future;
   }
 
+  /// 打印票据
   Future<PosPrintResult> printTicket(
     List<int> bytes, {
     int chunkSizeBytes = 20,

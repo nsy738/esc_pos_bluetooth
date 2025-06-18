@@ -264,6 +264,8 @@ class PrinterBluetoothManager {
     int chunkSizeBytes = 512,
     int queueSleepTimeMs = 20,
   }) async {
+     chunkSizeBytes = 512;
+     queueSleepTimeMs = 20;
     final Completer<PosPrintResult> completer = Completer();
     final serial.BluetoothDevice? device = _selectedPrinter?.serialDevice;
     if (device == null) {
@@ -298,6 +300,8 @@ class PrinterBluetoothManager {
         await _classic.disconnect();
       } catch (_) {}
       completer.complete(PosPrintResult.timeout);
+    } finally {
+      _isPrinting = false;
     }
     return completer.future;
   }

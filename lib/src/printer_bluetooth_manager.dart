@@ -62,8 +62,7 @@ class PrinterBluetoothManager {
   final serial.FlutterBluetoothClassic _classic = serial.FlutterBluetoothClassic();
   final BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
   Stream<bool> get isScanningStream => _isScanning.stream;
-  final BehaviorSubject<List<PrinterBluetooth>> _scanResults =
-      BehaviorSubject.seeded([]);
+  final BehaviorSubject<List<PrinterBluetooth>> _scanResults = BehaviorSubject.seeded([]);
   Stream<List<PrinterBluetooth>> get scanResults => _scanResults.stream;
   // 需根据实际打印机填写 Service/Characteristic UUID
   // 可通过 nRF Connect 等工具扫描获得
@@ -89,8 +88,7 @@ class PrinterBluetoothManager {
     // BLE扫描
     if (type == null || type == BluetoothType.ble) {
       _bleScanSub = FlutterBluePlus.scanResults.listen((results) {
-        found.addAll(results
-            .map((r) => PrinterBluetooth(r.device, advData: r.advertisementData)));
+        found.addAll(results.map((r) => PrinterBluetooth(r.device, advData: r.advertisementData)));
         _scanResults.add(List<PrinterBluetooth>.from(found));
       });
       FlutterBluePlus.startScan(timeout: timeout);
@@ -129,18 +127,23 @@ class PrinterBluetoothManager {
     List<int> bytes, {
     int chunkSizeBytes = 20,
     int queueSleepTimeMs = 20,
+    int delayTimeMs = 2000,
   }) async {
     if (_selectedPrinter == null) {
+      print('[SPP] No device selected');
       return Future<PosPrintResult>.value(PosPrintResult.printerNotSelected);
     } else if (_isScanning.value!) {
+      print('[SPP] Scan in progress');
       return Future<PosPrintResult>.value(PosPrintResult.scanInProgress);
     } else if (_isPrinting) {
+      print('[SPP] Print in progress');
       return Future<PosPrintResult>.value(PosPrintResult.printInProgress);
     }
     if (_selectedPrinter!.type == BluetoothType.ble) {
       return _writeBytesBle(bytes, chunkSizeBytes: chunkSizeBytes, queueSleepTimeMs: queueSleepTimeMs);
     } else {
-      return _writeBytesSpp(bytes, chunkSizeBytes: chunkSizeBytes, queueSleepTimeMs: queueSleepTimeMs);
+      return _writeBytesSpp(bytes,
+          chunkSizeBytes: chunkSizeBytes, queueSleepTimeMs: queueSleepTimeMs, delayTimeMs: delayTimeMs);
     }
   }
 
@@ -200,7 +203,8 @@ class PrinterBluetoothManager {
       BluetoothCharacteristic? writeChar;
       if (writableChars.isNotEmpty) {
         writeChar = writableChars.first['charObj'];
-        print('[BLE] Auto-selected first writable characteristic: service=${writableChars.first['service']}, char=${writableChars.first['char']}');
+        print(
+            '[BLE] Auto-selected first writable characteristic: service=${writableChars.first['service']}, char=${writableChars.first['char']}');
       } else {
         // 兼容：如果没找到，还是用UUID匹配
         for (var service in services) {
@@ -259,27 +263,56 @@ class PrinterBluetoothManager {
   }
 
   /// SPP写入逻辑
+  /// 关键设计思路：
+  /// 1. 每次连接前先断开，避免残留连接导致连接失败。
+  /// 2. 断开后延迟1秒再连接，确保设备和系统蓝牙栈恢复。
+  /// 3. 连接失败时自动重试一次，提升兼容性。
+  /// 4. 连接、发送、断开等关键步骤均增加详细日志，便于排查。
+  /// 5. 连接成功后再延迟0.5秒发送数据，确保socket ready，避免 NOT_CONNECTED 错误。
   Future<PosPrintResult> _writeBytesSpp(
     List<int> bytes, {
     int chunkSizeBytes = 512,
     int queueSleepTimeMs = 20,
+    int delayTimeMs = 2000,
   }) async {
-     chunkSizeBytes = 512;
-     queueSleepTimeMs = 20;
+    chunkSizeBytes = 512;
+    queueSleepTimeMs = 20;
     final Completer<PosPrintResult> completer = Completer();
     final serial.BluetoothDevice? device = _selectedPrinter?.serialDevice;
     if (device == null) {
+      print('[SPP] No device selected');
       return PosPrintResult.printerNotSelected;
     }
     try {
       _isPrinting = true;
-      // 连接
-      final connected = await _classic.connect(device.address);
+      // 连接前先断开，避免残留连接
+      try {
+        await _classic.disconnect();
+        print('[SPP] Disconnected before connect (cleanup)');
+        // 断开后等待1秒，确保设备和系统蓝牙栈恢复
+        await Future.delayed(Duration(seconds: 1));
+      } catch (_) {}
+      // 第一次连接
+      print('[SPP] Try connect to \u001b[33m${device.address}[0m');
+      bool connected = await _classic.connect(device.address);
+      if (!connected) {
+        print('[SPP] First connect failed, retry once...');
+        // 重试一次
+        try {
+          await _classic.disconnect();
+          await Future.delayed(Duration(seconds: 1));
+        } catch (_) {}
+        connected = await _classic.connect(device.address);
+      }
+      print('[SPP] Connect result: $connected');
       if (!connected) {
         _isPrinting = false;
         completer.complete(PosPrintResult.timeout);
         return completer.future;
       }
+      // 连接成功后等待0.5秒，确保socket ready
+      await Future.delayed(Duration(milliseconds: delayTimeMs));
+
       // 分包写入
       final len = bytes.length;
       List<List<int>> chunks = [];
@@ -288,37 +321,49 @@ class PrinterBluetoothManager {
         chunks.add(bytes.sublist(i, end));
       }
       for (var i = 0; i < chunks.length; i += 1) {
+        print('[SPP] Sending chunk \u001b[36m${i + 1}/${chunks.length}[0m, size=${chunks[i].length}');
         await _classic.sendData(chunks[i]);
         sleep(Duration(milliseconds: queueSleepTimeMs));
       }
       await _classic.disconnect();
+      print('[SPP] Disconnected after send');
       completer.complete(PosPrintResult.success);
       _isConnected = true;
     } catch (e) {
       _isPrinting = false;
+      print('[SPP] Error: $e');
       try {
         await _classic.disconnect();
+        print('[SPP] Disconnected after error');
       } catch (_) {}
       completer.complete(PosPrintResult.timeout);
     } finally {
       _isPrinting = false;
     }
+    // 断开后等待1秒，确保设备和系统蓝牙栈恢复
+    await Future.delayed(Duration(seconds: 1));
     return completer.future;
   }
 
-  /// 打印票据
-  Future<PosPrintResult> printTicket(
+  //print ble
+  Future<PosPrintResult> printTicketBle(List<int> bytes, {int chunkSizeBytes = 20, int queueSleepTimeMs = 20}) async {
+    if (bytes.isEmpty) {
+      return Future<PosPrintResult>.value(PosPrintResult.ticketEmpty);
+    }
+    return writeBytes(bytes, chunkSizeBytes: chunkSizeBytes, queueSleepTimeMs: queueSleepTimeMs);
+  }
+
+  //print spp
+  Future<PosPrintResult> printTicketSpp(
     List<int> bytes, {
-    int chunkSizeBytes = 20,
+    int chunkSizeBytes = 512,
     int queueSleepTimeMs = 20,
+    int delayTimeMs = 2000,
   }) async {
     if (bytes.isEmpty) {
       return Future<PosPrintResult>.value(PosPrintResult.ticketEmpty);
     }
-    return writeBytes(
-      bytes,
-      chunkSizeBytes: chunkSizeBytes,
-      queueSleepTimeMs: queueSleepTimeMs,
-    );
+    return _writeBytesSpp(bytes,
+        chunkSizeBytes: chunkSizeBytes, queueSleepTimeMs: queueSleepTimeMs, delayTimeMs: delayTimeMs);
   }
 }

@@ -275,20 +275,23 @@ class _MyHomePageState extends State<MyHomePage> {
     final profile = await CapabilityProfile.load();
 
     // TEST PRINT
-    final PosPrintResult resTest = await printerManager.printTicket(await testTicket(paper, profile));
+    //final PosPrintResult resTest = await printerManager.printTicket(await testTicket(paper, profile));
 
     // DEMO RECEIPT
-    final PosPrintResult res = await printerManager.printTicket((await demoReceipt(paper, profile)));
-
-    showToast(res.msg);
+    if (printer.type == BluetoothType.ble) {
+      final PosPrintResult res = await printerManager.printTicketBle((await demoReceipt(paper, profile)));
+      showToast(res.msg);
+    } else {
+      final PosPrintResult res = await printerManager.printTicketSpp((await demoReceipt(paper, profile)));
+      showToast(res.msg);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     // 优先显示有name的设备，无name的排在后面
-    List<PrinterBluetooth> filtered = _filterType == null
-        ? _devices
-        : _devices.where((d) => d.type == _filterType).toList();
+    List<PrinterBluetooth> filtered =
+        _filterType == null ? _devices : _devices.where((d) => d.type == _filterType).toList();
     final List<PrinterBluetooth> sortedDevices = [
       ...filtered.where((d) => (d.name != null && d.name!.trim().isNotEmpty)),
       ...filtered.where((d) => (d.name == null || d.name!.trim().isEmpty)),
